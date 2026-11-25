@@ -108,6 +108,13 @@ AuctionHouseBot.CompleteItemValueOverride.Items =
 AuctionHouseBot.CompleteItemValueOverride.DoApplyBidVariations = false
 AuctionHouseBot.CompleteItemValueOverride.DoApplyBuyoutVariations = false
 
+# Optional local market prices. One item ID,copper per unit line, without a header.
+# A validated nonempty file replaces the previous set. Missing items use normal pricing.
+# The override variation switches above apply here too.
+AuctionHouseBot.MarketPriceFile.Enabled = false
+AuctionHouseBot.MarketPriceFile.Path = ""
+
+
 ###############################################################################
 #    AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled
 #        Enable/Disable the Seller using items' in-game drop rates from Enemies

@@ -21,6 +21,7 @@
 #ifndef AUCTION_HOUSE_BOT_H
 #define AUCTION_HOUSE_BOT_H
 
+#include <filesystem>
 #include "Common.h"
 #include "ObjectGuid.h"
 
@@ -136,6 +137,17 @@ private:
     uint32 CyclesBetweenSellAction;
     uint32 CyclesBetweenSellActionMax;
     uint32 MaxBuyoutPriceInCopper;
+    bool MarketPriceFileEnabled = false;
+    std::string MarketPriceFilePath;
+    std::filesystem::file_time_type MarketPriceFileObservedTime = std::filesystem::file_time_type::min();
+    std::unordered_map<uint32, uint64> MarketPriceFileValues;
+    bool MarketPriceFileUnavailable = false;
+    bool MarketPriceFileValid = false;
+    bool MarketCatalogueDirty = true;
+    void ExportMarketCatalogue();
+    void RefreshMarketPriceFile();
+    uint32 MarketResetThrough = 0;
+
     bool CompleteItemValueOverrideEnabled;
     std::unordered_map<uint32, uint64> CompleteItemValueOverrideItemListByItemID;
     bool CompleteItemValueOverrideDoApplyBidVariations;
@@ -347,7 +359,8 @@ public:
     void Update();
     bool IsModuleEnabled();
     void InitializeConfiguration();
-    void EmptyAuctionHouses();
+    uint32 EmptyAuctionHouses(uint32 marketResetThrough = 0);
+    bool QueueMarketReset();
     uint32 GetRandomStackValue(std::string configKeyString, uint32 defaultValue);
     uint32 GetRandomStackIncrementValue(std::string configKeyString, uint32 defaultValue);
     void SetCyclesBetweenBuyOrSell();
