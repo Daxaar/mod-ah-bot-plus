@@ -29,7 +29,11 @@
 #include "ItemTemplate.h"
 #include "SharedDefines.h"
 #include "SpellMgr.h"
+#include <charconv>
 #include <cmath>
+#include <fstream>
+#include <limits>
+#include <string_view>
 
 #include <set>
 #include <unordered_map>
@@ -284,30 +288,145 @@ uint32 AuctionHouseBot::GetStackSizeForItem(ItemTemplate const* itemProto) const
         return 1;
 }
 
-void AuctionHouseBot::CalculateItemValue(ItemTemplate const* itemProto, uint64& outBidPrice, uint64& outBuyoutPrice)
+void AuctionHouseBot::ExportMarketCatalogue()
 {
-    if (CompleteItemValueOverrideEnabled == true)
+    if (!MarketCatalogueDirty || MarketPriceFilePath.empty())
+        return;
+
+    MarketCatalogueDirty = false;
+    std::set<uint32> items;
+    for (auto const& node : ItemListProportionNodesSeed)
     {
-        auto it = CompleteItemValueOverrideItemListByItemID.find(itemProto->ItemId);
-        if (it != CompleteItemValueOverrideItemListByItemID.end())
+        if (!node.Proportion)
+            continue;
+        auto const category = ItemCandidatesByItemClassAndQuality.find(node.ItemClassID);
+        if (category == ItemCandidatesByItemClassAndQuality.end())
+            continue;
+        auto const quality = category->second.find(node.ItemQualityID);
+        if (quality != category->second.end())
+            items.insert(quality->second.begin(), quality->second.end());
+    }
+
+    auto const path = std::filesystem::path(MarketPriceFilePath).parent_path() / "stock-catalogue.txt";
+    auto temporary = path;
+    temporary += ".tmp";
+    std::ofstream output(temporary, std::ios::trunc);
+    for (uint32 item : items)
+        output << item << '\n';
+    output.close();
+    std::error_code error;
+    if (output)
+        std::filesystem::rename(temporary, path, error);
+    if (!output || error)
+        LOG_WARN("module", "AHBot could not export its stock catalogue.");
+}
+
+void AuctionHouseBot::RefreshMarketPriceFile()
+{
+    if (!MarketPriceFileEnabled || MarketPriceFilePath.empty())
+        return;
+
+    std::error_code error;
+    auto const modified = std::filesystem::last_write_time(MarketPriceFilePath, error);
+    if (error)
+    {
+        if (!MarketPriceFileUnavailable)
+            LOG_WARN("module", "AHBot market file unavailable. Retaining {} prices.", MarketPriceFileValues.size());
+        MarketPriceFileUnavailable = true;
+        MarketPriceFileValid = false;
+        MarketPriceFileObservedTime = std::filesystem::file_time_type::min();
+        return;
+    }
+    MarketPriceFileUnavailable = false;
+    if (modified == MarketPriceFileObservedTime)
+        return;
+
+    MarketPriceFileObservedTime = modified;
+    MarketPriceFileValid = false;
+    constexpr uintmax_t maxBytes = 2 * 1024 * 1024;
+    auto const size = std::filesystem::file_size(MarketPriceFilePath, error);
+    if (error || size > maxBytes)
+    {
+        LOG_WARN("module", "AHBot market file cannot be read or exceeds 2 MiB. Keeping previous prices.");
+        return;
+    }
+
+    std::ifstream input(MarketPriceFilePath, std::ios::binary);
+    auto parseNumber = [](std::string_view text, auto& number)
+    {
+        auto const result = std::from_chars(text.data(), text.data() + text.size(), number);
+        return result.ec == std::errc{} && result.ptr == text.data() + text.size() && number > 0;
+    };
+    std::unordered_map<uint32, uint64> prices;
+    std::string line;
+    uint32 lineNumber = 0;
+    uintmax_t bytes = 0;
+    while (std::getline(input, line))
+    {
+        ++lineNumber;
+        bytes += line.size() + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        auto const comma = line.find(',');
+        uint32 id = 0;
+        uint64 copper = 0;
+        if (bytes > maxBytes || lineNumber > 50000 || comma == std::string::npos
+            || !parseNumber(std::string_view(line).substr(0, comma), id)
+            || !parseNumber(std::string_view(line).substr(comma + 1), copper)
+            || copper > MaxBuyoutPriceInCopper || !prices.emplace(id, copper).second)
         {
-            outBuyoutPrice = it->second;
-            if (CompleteItemValueOverrideDoApplyBuyoutVariations == true)
-                outBuyoutPrice = urand(outBuyoutPrice * (1.0f - BuyoutVariationReducePercent), outBuyoutPrice * (1.0f + BuyoutVariationAddPercent));
-
-            if (CompleteItemValueOverrideDoApplyBidVariations == true)
-            {
-                float sellVarianceBidPriceTopPercent = 1.0f - BidVariationHighReducePercent;
-                float sellVarianceBidPriceBottomPercent = 1.0f - BidVariationLowReducePercent;
-                outBidPrice = urand(sellVarianceBidPriceBottomPercent * outBuyoutPrice, sellVarianceBidPriceTopPercent * outBuyoutPrice);
-            }
-            else
-                outBidPrice = outBuyoutPrice;
-
+            LOG_WARN("module", "AHBot market file invalid at line {}. Keeping previous prices.", lineNumber);
             return;
         }
     }
 
+    if (!input.eof() || input.bad() || prices.empty())
+    {
+        LOG_WARN("module", "AHBot market file empty or unreadable. Keeping previous prices.");
+        return;
+    }
+    MarketPriceFileValues.swap(prices);
+    MarketPriceFileValid = true;
+    LOG_INFO("module", "AHBot loaded {} market prices.", MarketPriceFileValues.size());
+}
+
+void AuctionHouseBot::CalculateItemValue(ItemTemplate const* itemProto, uint64& outBidPrice, uint64& outBuyoutPrice)
+{
+    uint64 overridePrice = 0;
+    if (MarketPriceFileEnabled)
+    {
+        auto const it = MarketPriceFileValues.find(itemProto->ItemId);
+        if (it != MarketPriceFileValues.end())
+        {
+            uint64 const cap = std::numeric_limits<uint32>::max()
+                / std::max<uint32>(1, itemProto->GetMaxStackSize()) / 2;
+            if (it->second <= cap && it->second >= itemProto->SellPrice)
+                overridePrice = it->second;
+        }
+    }
+    if (!overridePrice && CompleteItemValueOverrideEnabled)
+    {
+        auto const it = CompleteItemValueOverrideItemListByItemID.find(itemProto->ItemId);
+        if (it != CompleteItemValueOverrideItemListByItemID.end())
+            overridePrice = it->second;
+    }
+    if (overridePrice)
+    {
+        outBuyoutPrice = overridePrice;
+        if (CompleteItemValueOverrideDoApplyBuyoutVariations == true)
+            outBuyoutPrice = urand(outBuyoutPrice * (1.0f - BuyoutVariationReducePercent), outBuyoutPrice * (1.0f + BuyoutVariationAddPercent));
+
+        if (CompleteItemValueOverrideDoApplyBidVariations == true)
+        {
+            float sellVarianceBidPriceTopPercent = 1.0f - BidVariationHighReducePercent;
+            float sellVarianceBidPriceBottomPercent = 1.0f - BidVariationLowReducePercent;
+            outBidPrice = urand(sellVarianceBidPriceBottomPercent * outBuyoutPrice, sellVarianceBidPriceTopPercent * outBuyoutPrice);
+        }
+        else
+            outBidPrice = outBuyoutPrice;
+
+        return;
+    }
 
     // Start with a buyout price related to the sell price, if configured
     if (UseItemSellPriceIfHigherThanPriceMinimumCenterBase == true)
@@ -736,6 +855,7 @@ bool AuctionHouseBot::IsItemADisabledRecipeProducedClassSubclass(ItemTemplate co
 
 void AuctionHouseBot::PopulateItemCandidatesAndProportions()
 {
+    MarketCatalogueDirty = true;
     // Clear old list and rebuild it
     ItemCandidatesByItemClassAndQuality.clear();
 
@@ -1858,6 +1978,16 @@ void AuctionHouseBot::Update()
     if ((SellingBotEnabled == false) && (BuyingBotEnabled == false))
         return;
 
+    ExportMarketCatalogue();
+    RefreshMarketPriceFile();
+    if (MarketResetThrough && MarketPriceFileEnabled && MarketPriceFileValid)
+    {
+        if (EmptyAuctionHouses(MarketResetThrough) == 0)
+        {
+            MarketResetThrough = 0;
+            LOG_INFO("module", "AHBot market reset completed.");
+        }
+    }
     LastBuyCycleCount++;
     LastSellCycleCount++;
 
@@ -1961,6 +2091,13 @@ void AuctionHouseBot::InitializeConfiguration()
     AddCharacters(charString);
 
     // Top level overrides
+    MarketPriceFileEnabled = sConfigMgr->GetOption<bool>("AuctionHouseBot.MarketPriceFile.Enabled", false);
+    MarketPriceFilePath = sConfigMgr->GetOption<std::string>("AuctionHouseBot.MarketPriceFile.Path", "");
+    if (!MarketPriceFileEnabled)
+        MarketResetThrough = 0;
+    MarketPriceFileObservedTime = std::filesystem::file_time_type::min();
+    MarketPriceFileUnavailable = false;
+    CompleteItemValueOverrideItemListByItemID.clear();
     CompleteItemValueOverrideEnabled = sConfigMgr->GetOption<bool>("AuctionHouseBot.CompleteItemValueOverride.Enabled", false);
     AddItemValuePairsToItemIDMap(CompleteItemValueOverrideItemListByItemID, sConfigMgr->GetOption<std::string>("AuctionHouseBot.CompleteItemValueOverride.Items", ""));
     CompleteItemValueOverrideDoApplyBidVariations = sConfigMgr->GetOption<bool>("AuctionHouseBot.CompleteItemValueOverride.DoApplyBidVariations", false);
@@ -1985,6 +2122,7 @@ void AuctionHouseBot::InitializeConfiguration()
     AdvancedListingRuleUseDropRatesExceptionItems.clear();
     ParseNumberListToSet(AdvancedListingRuleUseDropRatesExceptionItems, sConfigMgr->GetOption<std::string>("AuctionHouseBot.AdvancedListingRules.UseDropRates.DisabledItemIDs", ""), "AdvancedListingRules.UseDropRates.DisabledItemIDs");
     MaxBuyoutPriceInCopper = sConfigMgr->GetOption<uint32>("AuctionHouseBot.MaxBuyoutPriceInCopper", 1000000000);
+    RefreshMarketPriceFile();
     BuyoutVariationReducePercent = sConfigMgr->GetOption<float>("AuctionHouseBot.BuyoutVariationReducePercent", 0.15f);
     BuyoutVariationAddPercent = sConfigMgr->GetOption<float>("AuctionHouseBot.BuyoutVariationAddPercent", 0.25f);
     BidVariationHighReducePercent = sConfigMgr->GetOption<float>("AuctionHouseBot.BidVariationHighReducePercent", 0);
@@ -2235,12 +2373,25 @@ void AuctionHouseBot::InitializeConfiguration()
     NeutralConfig.SetMaxItems(sConfigMgr->GetOption<uint32>("AuctionHouseBot.Neutral.MaxItems", 15000));
 }
 
-void AuctionHouseBot::EmptyAuctionHouses()
+bool AuctionHouseBot::QueueMarketReset()
+{
+    RefreshMarketPriceFile();
+    if (!MarketPriceFileEnabled || !MarketPriceFileValid || MarketResetThrough)
+        return false;
+
+    QueryResult const result = CharacterDatabase.Query("SELECT COALESCE(MAX(id),0) FROM auctionhouse");
+    if (!result)
+        return false;
+    MarketResetThrough = result->Fetch()[0].Get<uint32>();
+    return MarketResetThrough != 0;
+}
+
+uint32 AuctionHouseBot::EmptyAuctionHouses(uint32 marketResetThrough)
 {
     if (AHCharactersGUIDsForQuery.empty())
     {
         LOG_ERROR("module", "AuctionHouseBot: No character GUIDs found when emptying Auction Houses via '.ahbot empty' .");
-        return;
+        return 0;
     }
 
     struct AuctionInfo {
@@ -2253,10 +2404,14 @@ void AuctionHouseBot::EmptyAuctionHouses()
 
     // Get all auctions owned by AHBots
     std::string queryString = "SELECT id, buyguid, houseid FROM auctionhouse WHERE itemowner IN ({})";
+    if (marketResetThrough)
+        queryString += " AND buyguid=0 AND lastbid=0 AND id<=" + std::to_string(marketResetThrough)
+            + " ORDER BY id LIMIT 150";
     QueryResult result = CharacterDatabase.Query(queryString, AHCharactersGUIDsForQuery);
     if (!result)
-        return;
+        return 0;
 
+    uint32 removed = 0;
     if (result->GetRowCount() > 0)
     {
         // Load results into vector<AuctionInfo> for lookups later
@@ -2290,6 +2445,10 @@ void AuctionHouseBot::EmptyAuctionHouses()
             AuctionEntry* auction = auctionHouse->GetAuction(ai.itemID);
             if (!auction)
                 continue;
+            if (marketResetThrough && (auction->bidder || auction->bid ||
+                std::none_of(AHCharacters.begin(), AHCharacters.end(),
+                    [auction](auto const& bot) { return bot.CharacterGUID == auction->owner.GetCounter(); })))
+                continue;
 
             // If auction has a bidder, refund that character
             if (ai.characterGUID != 0)
@@ -2305,10 +2464,13 @@ void AuctionHouseBot::EmptyAuctionHouses()
             auction->DeleteFromDB(trans);
             sAuctionMgr->RemoveAItem(auction->item_guid);
             auctionHouse->RemoveAuction(auction);
+            ++removed;
         }
     }
 
-    CharacterDatabase.CommitTransaction(trans);
+    if (removed)
+        CharacterDatabase.CommitTransaction(trans);
+    return removed;
 }
 
 uint32 AuctionHouseBot::GetRandomStackValue(std::string configKeyString, uint32 defaultValue)

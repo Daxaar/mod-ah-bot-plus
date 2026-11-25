@@ -182,6 +182,7 @@ public:
         static Acore::ChatCommands::ChatCommandTable AHBotCommandTable = {
             {"update", HandleAHBotUpdateCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"reload", HandleAHBotReloadCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
+            {"marketreset", HandleMarketResetCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"empty",  HandleAHBotEmptyCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"help",  HandleAHBotHelpCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes}
         };
@@ -224,6 +225,22 @@ public:
         return true;
     }
 
+    static bool HandleMarketResetCommand(ChatHandler* handler, char const* args)
+    {
+        if (std::string_view(args ? args : "") != "confirm")
+        {
+            handler->SendSysMessage("Publish the historical price set first, then run .ahbot marketreset confirm.");
+            return true;
+        }
+        if (!AuctionHouseBot::instance()->QueueMarketReset())
+        {
+            handler->SendSysMessage("Market reset unavailable. Check the price file and whether a reset is already running.");
+            return true;
+        }
+        handler->SendSysMessage("Market reset queued. Bid-bearing and player-owned auctions are preserved.");
+        return true;
+    }
+
     static bool HandleAHBotEmptyCommand(ChatHandler* handler, char const* /*args*/)
     {
         LOG_INFO("module", "AuctionHouseBot: Emptying Auction House...");
@@ -239,6 +256,7 @@ public:
     {
         handler->PSendSysMessage("AuctionHouseBot commands:");
         handler->PSendSysMessage("  .ahbot reload - Reloads configuration");
+        handler->PSendSysMessage("  .ahbot marketreset confirm - Refreshes unbid bot listings in batches");
         handler->PSendSysMessage("  .ahbot empty  - Removes all AuctionHouseBot auctions");
         handler->PSendSysMessage("  .ahbot update - Runs an update cycle");
         return true;
